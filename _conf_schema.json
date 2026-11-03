@@ -1,0 +1,120 @@
+{
+    "comfy": {
+        "description": "ComfyUI 本地算力配置",
+        "type": "object",
+        "items": {
+            "host": {
+                "type": "string",
+                "default": "127.0.0.1",
+                "description": "ComfyUI 主机 IP"
+            },
+            "port": {
+                "type": "int",
+                "default": 8188,
+                "description": "ComfyUI 端口"
+            },
+            "username": {
+                "type": "string",
+                "default": "",
+                "description": "ComfyUI-Login 账号"
+            },
+            "password": {
+                "type": "string",
+                "default": "",
+                "description": "ComfyUI-Login 密码",
+                "secret": true
+            }
+        }
+    },
+    "nai": {
+        "description": "NovelAI 备用通道配置",
+        "type": "object",
+        "items": {
+            "endpoint": {
+                "type": "string",
+                "default": "https://api.ttapi.io/novelai/text-to-image",
+                "description": "API 接口地址"
+            },
+            "token": {
+                "type": "string",
+                "default": "",
+                "description": "API Token",
+                "secret": true
+            },
+            "proxy": {
+                "type": "string",
+                "default": "",
+                "description": "本地 HTTP/SOCKS 代理地址"
+            },
+            "promptPreset": {
+                "type": "text",
+                "default": "",
+                "description": "NAI 默认正向垫词"
+            }
+        }
+    },
+    "quota": {
+        "description": "配额与频控设置",
+        "type": "object",
+        "items": {
+            "dailyLimit": {
+                "type": "int",
+                "default": 3,
+                "description": "每日签到赠送额度"
+            },
+            "cooldownSeconds": {
+                "type": "int",
+                "default": 45,
+                "description": "绘图冷却时间（秒）"
+            }
+        }
+    },
+    "whitelist": {
+        "description": "超级白名单用户（填入QQ号或用户ID，逗号或回车换行）",
+        "type": "list",
+        "default": []
+    },
+    "current_lora_preset": {
+        "description": "当前启用的 LoRA 预设名称",
+        "type": "string",
+        "default": "default",
+        "hint": "填入下方预设列表中已存在的预设名称（例如 default 或 newest）"
+    },
+    "lora_presets": {
+        "description": "LoRA 风格预设管理列表（可视化增删改查）",
+        "type": "template_list",
+        "default": [],
+        "templates": {
+            "preset_template": {
+                "name": "LoRA 预设项",
+                "items": {
+                    "name": {
+                        "description": "预设标识名称（唯一标识，用于切换或模型指定）",
+                        "type": "string",
+                        "default": "new_style"
+                    },
+                    "text": {
+                        "description": "LoRA 标签文本（输入形如 <lora:名称:权重>，系统自动解析）",
+                        "type": "text",
+                        "default": ""
+                    },
+                    "description": {
+                        "description": "风格描述（供模型感知画风特点）",
+                        "type": "string",
+                        "default": ""
+                    },
+                    "tags": {
+                        "description": "风格标签（逗号分隔）",
+                        "type": "string",
+                        "default": ""
+                    },
+                    "scenarios": {
+                        "description": "适用场景（逗号分隔）",
+                        "type": "string",
+                        "default": ""
+                    }
+                }
+            }
+        }
+    }
+}

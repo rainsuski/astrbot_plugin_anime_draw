@@ -1,0 +1,5 @@
+name: astrbot_plugin_anime_draw
+author: suski
+version: 1.0.0
+description: 二次元插画绘制插件（支持 ComfyUI/NAI 双引擎自动降级、原生指令签到、防注入权威鉴权与 SFW 审查）
+repo: ""
