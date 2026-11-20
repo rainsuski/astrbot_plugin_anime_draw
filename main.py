@@ -1,3 +1,6 @@
+# astrbot_plugin_anime_draw/main.py
+# 插件主入口（负责事件监听、CLI 参数解析、白名单鉴权、Pipeline 调度、降级回显与 LLM 工具暴露）
+
 import asyncio
 import base64
 import random
@@ -19,6 +22,7 @@ from .core.constants import ALLOWED_RESOLUTIONS
 from .core.image import ImageProcessor
 from .core.lora import LoraPresetManager
 from .core.quota import QuotaManager
+from .core.workflow import WorkflowPresetManager
 from .engines.comfy import ComfyEngine
 from .engines.nai import NaiEngine
 
@@ -26,13 +30,13 @@ from .engines.nai import NaiEngine
 @register(
     "astrbot_plugin_anime_draw",
     "Author",
-    "二次元插画绘图插件（模块化解耦版，支持界面化 LoRA 预设管理与主动风格选择）",
-    "2.0.1",
+    "二次元插画绘图插件（支持多工作流预设、LoRA 强绑定校验与多通道降级调度）",
+    "2.1.0",
 )
 class AnimeDrawPlugin(Star):
-    def __init__(self, context: Context, config: dict = None):
+    def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
-        self.config = config or {}
+        self.config: dict[str, Any] = config or {}
 
         self.data_dir = Path("data/astrbot_plugin_anime_draw")
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -41,15 +45,68 @@ class AnimeDrawPlugin(Star):
 
         # 实例化业务核心与引擎组件
         self.quota_mgr = QuotaManager(self.data_dir / "draw_quota.json")
+        self.workflow_mgr = WorkflowPresetManager(self.config)
         self.lora_mgr = LoraPresetManager(self.config)
         self.comfy_engine = ComfyEngine(self.config)
         self.nai_engine = NaiEngine(self.config)
 
-    def _is_whitelisted(self, user_id: str) -> bool:
-        whitelist = [
-            str(x).strip() for x in self.config.get("whitelist", []) if str(x).strip()
-        ]
-        return str(user_id).strip() in whitelist
+    def _sync_configs(self) -> None:
+        """实时向各子模块同步最新插件配置。"""
+        self.workflow_mgr.update_config(self.config)
+        self.lora_mgr.update_config(self.config)
+        self.comfy_engine.update_config(self.config)
+        self.nai_engine.update_config(self.config)
+
+    def _build_whitelist_sets(self) -> tuple[set[str], set[str]]:
+        """解析并标准化白名单配置，返回 (原始完整串集合, 纯 ID 提取集合)。"""
+        raw_cfg = self.config.get("whitelist", [])
+        if isinstance(raw_cfg, str):
+            entries = [raw_cfg]
+        elif isinstance(raw_cfg, list):
+            entries = [str(item) for item in raw_cfg]
+        else:
+            entries = []
+
+        raw_set: set[str] = set()
+        pure_id_set: set[str] = set()
+
+        for entry in entries:
+            tokens = re.split(r"[,;\s\r\n]+", entry.strip())
+            for token in tokens:
+                clean_token = token.strip()
+                if not clean_token:
+                    continue
+                raw_set.add(clean_token)
+                pure_id = clean_token.split(":")[-1].strip()
+                if pure_id:
+                    pure_id_set.add(pure_id)
+
+        return raw_set, pure_id_set
+
+    def _is_whitelisted(self, user_id: str, unified_origin: str = "") -> bool:
+        """双向归一化白名单校验，兼容纯数字 ID 与 AstrBot unified_msg_origin。"""
+        raw_set, pure_id_set = self._build_whitelist_sets()
+        if not raw_set and not pure_id_set:
+            return False
+
+        uid = str(user_id or "").strip()
+        origin = str(unified_origin or "").strip()
+
+        if uid:
+            if uid in pure_id_set or uid in raw_set:
+                return True
+            uid_tail = uid.split(":")[-1].strip()
+            if uid_tail and uid_tail in pure_id_set:
+                return True
+
+        if origin:
+            if origin in raw_set:
+                return True
+            origin_tail = origin.split(":")[-1].strip()
+            if origin_tail and origin_tail in pure_id_set:
+                return True
+
+        return False
 
     @staticmethod
     def _sanitize_error(error_obj: Any) -> str:
@@ -79,6 +136,92 @@ class AnimeDrawPlugin(Star):
             cleaned = cleaned[:200] + "...(已截断)"
         return cleaned
 
+    @staticmethod
+    def _tokenize_cli_args(raw_args: str) -> list[str]:
+        """容错型 CLI 分词器：支持完整引号包裹的参数，同时免疫正向提示词中的孤立单引号（如 girl's）。"""
+        tokens: list[str] = []
+        n = len(raw_args)
+        i = 0
+
+        while i < n:
+            while i < n and raw_args[i].isspace():
+                i += 1
+            if i >= n:
+                break
+
+            quote_char = raw_args[i]
+            if quote_char in ('"', "'"):
+                close_idx = raw_args.find(quote_char, i + 1)
+                if close_idx != -1:
+                    tokens.append(raw_args[i + 1 : close_idx])
+                    i = close_idx + 1
+                    continue
+
+            start = i
+            while i < n and not raw_args[i].isspace():
+                i += 1
+            tokens.append(raw_args[start:i])
+
+        return tokens
+
+    @classmethod
+    def _parse_draw_cli(cls, raw_args: str) -> dict[str, str]:
+        """解析 /绘图 指令的 CLI 参数标志与剩余正向提示词。"""
+        tokens = cls._tokenize_cli_args(raw_args)
+        flag_map = {
+            "-w": "workflow",
+            "--workflow": "workflow",
+            "-s": "style",
+            "--style": "style",
+            "-l": "style",
+            "--lora": "style",
+            "-r": "resolution",
+            "--res": "resolution",
+            "--resolution": "resolution",
+            "-n": "negative",
+            "--neg": "negative",
+            "--negative": "negative",
+        }
+
+        parsed: dict[str, str] = {
+            "workflow": "",
+            "style": "",
+            "resolution": "",
+            "negative": "",
+            "prompt": "",
+        }
+        prompt_tokens: list[str] = []
+
+        idx = 0
+        total = len(tokens)
+        while idx < total:
+            tok = tokens[idx]
+            tok_lower = tok.lower()
+
+            if tok_lower in flag_map:
+                field = flag_map[tok_lower]
+                if idx + 1 < total:
+                    parsed[field] = tokens[idx + 1].strip()
+                    idx += 2
+                else:
+                    idx += 1
+                continue
+
+            matched_eq = False
+            if "=" in tok and tok.startswith("-"):
+                flag_part, val_part = tok.split("=", 1)
+                flag_lower = flag_part.lower()
+                if flag_lower in flag_map:
+                    parsed[flag_map[flag_lower]] = val_part.strip()
+                    matched_eq = True
+
+            if not matched_eq:
+                prompt_tokens.append(tok)
+            idx += 1
+
+        parsed["prompt"] = " ".join(prompt_tokens).strip()
+        return parsed
+
     # ================= 业务调度底层 =================
     async def _execute_draw_pipeline(
         self,
@@ -87,28 +230,93 @@ class AnimeDrawPlugin(Star):
         negative: str = "",
         resolution: str = "1024x1024",
         opening_remark: str = "",
+        workflow_preset: str = "",
         lora_preset: str = "",
         use_private_paper: bool = False,
         from_companion: bool = False,
     ) -> tuple[bool, str, bytes | None, Path | None]:
         # 实时同步配置
-        self.lora_mgr.update_config(self.config)
-        self.comfy_engine.update_config(self.config)
-        self.nai_engine.update_config(self.config)
+        self._sync_configs()
 
-        user_id = str(event.get_sender_id()) if event else ""
-        is_whitelist = self._is_whitelisted(user_id) if user_id else False
+        # 0. 解析并校验工作流与 LoRA 强绑定关系（先于额度检查拦截无效请求）
+        req_workflow = (workflow_preset or "").strip()
+        if req_workflow:
+            active_workflow = self.workflow_mgr.get_preset(req_workflow)
+            if active_workflow is None:
+                avail_names = ", ".join(
+                    item["name"] for item in self.workflow_mgr.list_presets_meta()
+                )
+                return (
+                    False,
+                    f"❌ 未找到预设 [{req_workflow}]。当前可用预设: {avail_names}",
+                    None,
+                    None,
+                )
+        else:
+            active_workflow = self.workflow_mgr.get_preset(None)
+
+        assert active_workflow is not None
+        workflow_name = active_workflow["name"]
+
+        req_lora = (lora_preset or "").strip()
+        active_lora: dict[str, Any] | None = None
+        if req_lora:
+            target_lora = self.lora_mgr.find_preset(req_lora)
+            if target_lora is None:
+                return (
+                    False,
+                    f"❌ 未找到风格预设 [{req_lora}]，请核对名称或留空使用预设默认风格。",
+                    None,
+                    None,
+                )
+            if not self.lora_mgr.is_compatible_with_workflow(
+                target_lora, workflow_name
+            ):
+                return (
+                    False,
+                    f"❌ 风格 [{target_lora['name']}] 不适用于当前预设 [{workflow_name}]，请重新选择或留空使用默认风格。",
+                    None,
+                    None,
+                )
+            active_lora = target_lora
+        else:
+            default_lora_name = active_workflow.get("default_lora", "").strip()
+            if default_lora_name:
+                candidate = self.lora_mgr.find_preset(default_lora_name)
+                if candidate and self.lora_mgr.is_compatible_with_workflow(
+                    candidate, workflow_name
+                ):
+                    active_lora = candidate
+
+        logger.info(
+            f"[Draw] 开始调度生图: workflow={workflow_name}, "
+            f"lora={active_lora['name'] if active_lora else 'None'}, "
+            f"resolution={resolution}"
+        )
+
+        # 1. 鉴权与额度检查（支持 unified_msg_origin 与纯数字 ID 双向归一化匹配）
+        sender_id = str(event.get_sender_id()).strip() if event else ""
+        unified_origin = (
+            str(getattr(event, "unified_msg_origin", "")).strip() if event else ""
+        )
+        quota_user_key = sender_id or (
+            unified_origin.split(":")[-1].strip() if unified_origin else ""
+        )
+        is_whitelist = (
+            self._is_whitelisted(sender_id, unified_origin)
+            if (sender_id or unified_origin)
+            else False
+        )
         cd = self.config.get("quota", {}).get("cooldownSeconds", 45)
         daily_limit = self.config.get("quota", {}).get("dailyLimit", 3)
 
-        # 1. 鉴权与额度检查
         if use_private_paper or from_companion:
             can_draw, reason = self.quota_mgr.can_draw_siwan_private(
                 cooldown_seconds=15
             )
         else:
             can_draw, reason = self.quota_mgr.can_draw_user(
-                user_id, is_whitelist, cd, daily_limit
+                quota_user_key, is_whitelist, cd, daily_limit
             )
 
         if not can_draw:
@@ -140,15 +348,19 @@ class AnimeDrawPlugin(Star):
             " ,"
         )
 
-        # 5. 动态加载所选 LoRA 预设结构
-        active_lora = self.lora_mgr.get_preset(lora_preset)
-
-        # 6. 执行生图
-        raw_buffer = None
+        # 5. 执行生图（记录实际成功通道）
+        raw_buffer: bytes | None = None
+        used_engine = ""
         try:
             raw_buffer = await self.comfy_engine.run(
-                final_pos, final_neg, resolution, active_lora
+                workflow_json=active_workflow["workflow_json"],
+                positive=final_pos,
+                negative=final_neg,
+                resolution=resolution,
+                lora_cfg=active_lora,
             )
+            if raw_buffer:
+                used_engine = "comfy"
         except Exception as e:
             logger.warning(f"[Draw] ComfyUI 出错: {self._sanitize_error(e)}")
 
@@ -156,6 +368,8 @@ class AnimeDrawPlugin(Star):
             logger.info("[Draw] 降级至 NAI 通道...")
             try:
                 raw_buffer = await self.nai_engine.run(final_pos, final_neg, resolution)
+                if raw_buffer:
+                    used_engine = "nai"
             except Exception as e:
                 logger.error(f"[Draw] NAI 通道出错: {self._sanitize_error(e)}")
 
@@ -167,82 +381,37 @@ class AnimeDrawPlugin(Star):
                 None,
             )
 
-        # 7. 洗数据与长期存储落盘
+        # 6. 洗数据与长期存储落盘
         clean_bytes = ImageProcessor.clean_image_metadata(raw_buffer)
         filename = f"anime_{int(time.time())}_{random.randint(100, 999)}.png"
         img_path = self.img_dir / filename
         with open(img_path, "wb") as f:
             f.write(clean_bytes)
 
-        # 8. 扣减额度
+        # 7. 扣减额度
         if use_private_paper or from_companion:
             self.quota_mgr.deduct_siwan_private()
         else:
-            self.quota_mgr.deduct_user(user_id, is_whitelist)
+            self.quota_mgr.deduct_user(quota_user_key, is_whitelist)
 
-        # 9. 发送图片（针对 OneBot/NapCat 走原生 API 直传文件路径，绕过 AstrBot 强转 base64 逻辑）
-        if not from_companion and event:
+        # 8. 构造极简回显文案（仅当 ComfyUI 通道实际挂载了有效 LoRA 时回显风格）
+        if used_engine == "comfy" and active_lora and active_lora.get("name"):
+            finish_text = f"✨ 绘制完成！[风格: {active_lora['name']}]\n"
+        else:
+            finish_text = "✨ 绘制完成！\n"
+
+        # 9. 发送图片（统一交由 AstrBot 标准消息链发送）
+        if not from_companion and event and hasattr(event, "send"):
             try:
                 abs_img_path = str(img_path.resolve())
-
-                # 检测是否为 OneBot (aiocqhttp) 平台
-                is_aiocqhttp = (
-                    hasattr(event, "get_platform_name")
-                    and event.get_platform_name() == "aiocqhttp"
-                ) or hasattr(event, "bot")
-
-                if is_aiocqhttp and hasattr(event, "bot"):
-                    # 优先采用 NapCat/OneBot 原生消息段，直接传递真实绝对路径（不走 AstrBot 的 convert_to_base64）
-                    group_id = (
-                        event.get_group_id() if hasattr(event, "get_group_id") else None
+                await event.send(
+                    event.chain_result(
+                        [
+                            Plain(finish_text),
+                            CompImage.fromFileSystem(abs_img_path),
+                        ]
                     )
-                    sender_id = (
-                        event.get_sender_id()
-                        if hasattr(event, "get_sender_id")
-                        else None
-                    )
-
-                    # 组装 OneBot 原生消息段：NapCat 支持原生本地绝对路径
-                    onebot_message = [
-                        {
-                            "type": "text",
-                            "data": {
-                                "text": f"✨ 绘制完成！[风格: {active_lora['name']}]\n"
-                            },
-                        },
-                        {
-                            "type": "image",
-                            "data": {
-                                "file": abs_img_path
-                            },  # NapCat 原生识别本地物理路径，不产生 base64
-                        },
-                    ]
-
-                    if group_id and str(group_id) not in ("0", ""):
-                        await event.bot.call_action(
-                            "send_group_msg",
-                            group_id=int(group_id),
-                            message=onebot_message,
-                        )
-                    elif sender_id:
-                        await event.bot.call_action(
-                            "send_private_msg",
-                            user_id=int(sender_id),
-                            message=onebot_message,
-                        )
-                else:
-                    # 非 OneBot 平台，回退到框架标准发送链路
-                    if hasattr(event, "send"):
-                        await event.send(
-                            event.chain_result(
-                                [
-                                    Plain(
-                                        f"✨ 绘制完成！[风格: {active_lora['name']}]\n"
-                                    ),
-                                    CompImage.fromFileSystem(abs_img_path),
-                                ]
-                            )
-                        )
+                )
             except Exception as e:
                 clean_err = self._sanitize_error(e)
                 logger.error(f"[Draw] 协议端发图失败: {clean_err}")
@@ -267,7 +436,7 @@ class AnimeDrawPlugin(Star):
         resolution: str = "1024x1024",
         lora_preset: str = "",
         from_companion: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> CallToolResult:
         """【画图工具】绘制二次元动漫插画。
 
@@ -286,12 +455,13 @@ class AnimeDrawPlugin(Star):
                 negative=negative_prompt,
                 resolution=resolution,
                 opening_remark=opening_remark,
+                workflow_preset="",
                 lora_preset=lora_preset,
                 use_private_paper=use_private_paper,
                 from_companion=from_companion,
             )
 
-            if not success:
+            if not success or clean_bytes is None or img_path is None:
                 clean_msg = self._sanitize_error(msg)
                 return CallToolResult(
                     content=[
@@ -323,7 +493,6 @@ class AnimeDrawPlugin(Star):
                 ]
             )
         except Exception as e:
-            # 严格防止未捕获异常上抛给 tool_loop_agent_runner
             clean_err = self._sanitize_error(e)
             logger.error(f"[Draw] 工具执行异常: {clean_err}")
             return CallToolResult(
@@ -340,14 +509,18 @@ class AnimeDrawPlugin(Star):
     async def tool_query_styles(self, event: AstrMessageEvent) -> CallToolResult:
         """【查询画风风格】获取当前插件支持的所有 LoRA 风格名称、特点描述、标签及适用场景。方便你在绘图前按需挑选合适的 lora_preset。"""
         try:
-            self.lora_mgr.update_config(self.config)
+            self._sync_configs()
             meta_list = self.lora_mgr.list_presets_meta()
+            current_workflow = self.workflow_mgr.get_default_preset_name()
             current_active = self.config.get("current_lora_preset", "default")
 
-            lines = [f"🎨 当前系统默认全局风格为: [{current_active}]\n可选风格列表:"]
+            lines = [
+                f"🎨 当前全局默认预设为: [{current_workflow}]，兜底风格为: [{current_active}]\n可选风格列表:"
+            ]
             for p in meta_list:
                 lines.append(
                     f"- 名称: {p['name']}\n"
+                    f"  适用预设: {p['workflows']}\n"
                     f"  描述: {p['description']}\n"
                     f"  标签: {p['tags']}\n"
                     f"  适用场景: {p['scenarios']}"
@@ -372,7 +545,8 @@ class AnimeDrawPlugin(Star):
     ) -> CallToolResult:
         """【画纸额度查询】查询群友剩余的画纸张数，或查询四碗自己剩余的私房画纸。"""
         try:
-            sender_id = str(event.get_sender_id())
+            sender_id = str(event.get_sender_id()).strip()
+            unified_origin = str(getattr(event, "unified_msg_origin", "")).strip()
             query_id = target_user_id.strip() if target_user_id.strip() else sender_id
             daily_limit = self.config.get("quota", {}).get("dailyLimit", 3)
 
@@ -395,7 +569,11 @@ class AnimeDrawPlugin(Star):
                     f"（提醒：私房画纸每天 0 点刷新，省着点用哦！）"
                 )
             else:
-                is_wl = self._is_whitelisted(query_id)
+                is_wl = (
+                    self._is_whitelisted(query_id, unified_origin)
+                    if query_id == sender_id
+                    else self._is_whitelisted(query_id)
+                )
                 user_left = (
                     "无限（经纪人特权）"
                     if is_wl
@@ -416,19 +594,92 @@ class AnimeDrawPlugin(Star):
                 content=[TextContent(type="text", text=f'{{"error": "{clean_err}"}}')]
             )
 
-    # ================= 触发途径 4：指令直出 =================
+    # ================= 触发途径 4：辅助预设查询指令 =================
+    @filter.command("绘图预设", priority=1000)
+    async def cmd_workflow_presets(self, event: AstrMessageEvent):
+        """查询当前可用的预设列表。用法：/绘图预设"""
+        event.stop_event()
+        try:
+            self._sync_configs()
+            meta_list = self.workflow_mgr.list_presets_meta()
+            lines = ["📋 可用预设列表:"]
+            for item in meta_list:
+                prefix = "[默认] " if item["is_default"] else ""
+                default_lora = item["default_lora"] or "无（纯底模出图）"
+                lines.append(
+                    f"- {prefix}{item['name']}\n"
+                    f"  描述: {item['description']}\n"
+                    f"  默认风格: {default_lora}"
+                )
+            lines.append("💡 提示: 绘图时可通过 -w <名称> 指定预设")
+            await event.send(event.plain_result("\n".join(lines)))
+        except Exception as e:
+            clean_err = self._sanitize_error(e)
+            logger.error(f"[Draw] 查询预设异常: {clean_err}")
+            await event.send(event.plain_result(f"❌ 查询预设失败: {clean_err}"))
+
+    # ================= 触发途径 5：指令直出 =================
     @filter.command("绘图", alias={"画图", "draw"}, priority=1000)
     async def cmd_draw(self, event: AstrMessageEvent):
-        """手动绘图指令。用法：/绘图 1girl, white hair"""
+        """手动绘图指令。用法：/绘图 [-w 预设] [-s 风格] [-r 分辨率] [-n 负向词] <提示词>"""
         msg_str = event.message_str.strip()
-        clean_prompt = re.sub(
+        raw_args = re.sub(
             r"^[!/\\#]?(绘图|画图|draw)\s*", "", msg_str, flags=re.IGNORECASE
         ).strip()
+
+        parsed = self._parse_draw_cli(raw_args)
+        clean_prompt = parsed["prompt"]
+
+        event.stop_event()
+
+        if not clean_prompt:
+            await event.send(
+                event.plain_result(
+                    "💡 请提供提示词，例如：/绘图 1girl, silver hair, blue eyes\n"
+                    '可选参数：-w <预设> -s <风格> -r <分辨率> -n "<负向词>"'
+                )
+            )
+            return
+
+        try:
+            await event.send(event.plain_result("🎨 正在绘制，请稍候..."))
+        except Exception as e:
+            logger.warning(f"[Draw] 发送绘图提示失败: {self._sanitize_error(e)}")
+
+        try:
+            success, msg, _, _ = await self._execute_draw_pipeline(
+                event,
+                prompt=clean_prompt,
+                negative=parsed["negative"],
+                resolution=parsed["resolution"] or "1024x1024",
+                workflow_preset=parsed["workflow"],
+                lora_preset=parsed["style"],
+                use_private_paper=False,
+            )
+            if not success:
+                await event.send(event.plain_result(self._sanitize_error(msg)))
+        except Exception as e:
+            clean_err = self._sanitize_error(e)
+            logger.error(f"[Draw] 指令直出执行异常: {clean_err}")
+            await event.send(event.plain_result(f"❌ 绘图失败: {clean_err}"))
+
+    # ================= 触发途径 5：指令直出 =================
+    @filter.command("绘图", alias={"画图", "draw"}, priority=1000)
+    async def cmd_draw(self, event: AstrMessageEvent):
+        """手动绘图指令。用法：/绘图 [-w 预设] [-s 风格] [-r 分辨率] [-n 负向词] <提示词>"""
+        msg_str = event.message_str.strip()
+        raw_args = re.sub(
+            r"^[!/\\#]?(绘图|画图|draw)\s*", "", msg_str, flags=re.IGNORECASE
+        ).strip()
+
+        parsed = self._parse_draw_cli(raw_args)
+        clean_prompt = parsed["prompt"]
 
         if not clean_prompt:
             event.stop_event()
             yield event.plain_result(
-                "💡 请提供提示词，例如：/绘图 1girl, silver hair, blue eyes"
+                "💡 请提供提示词，例如：/绘图 1girl, silver hair, blue eyes\n"
+                '可选参数：-w <预设> -s <风格> -r <分辨率> -n "<负向词>"'
             )
             return
 
@@ -438,8 +689,10 @@ class AnimeDrawPlugin(Star):
             success, msg, _, _ = await self._execute_draw_pipeline(
                 event,
                 prompt=clean_prompt,
-                negative="",
-                resolution="1024x1024",
+                negative=parsed["negative"],
+                resolution=parsed["resolution"] or "1024x1024",
+                workflow_preset=parsed["workflow"],
+                lora_preset=parsed["style"],
                 use_private_paper=False,
             )
             if not success:

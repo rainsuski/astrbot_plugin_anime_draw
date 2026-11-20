@@ -1,5 +1,9 @@
+# astrbot_plugin_anime_draw/engines/nai.py
+# NovelAI 备用降级绘图引擎（当本地 ComfyUI 离线或异常时自动接管生图）
+
 import base64
 import re
+from typing import Any
 
 import httpx
 
@@ -7,22 +11,28 @@ from ..core.constants import ALLOWED_RESOLUTIONS
 
 
 class NaiEngine:
-    def __init__(self, config: dict):
+    """NovelAI 备用通道异步绘图引擎。"""
+
+    def __init__(self, config: dict[str, Any]):
         self.config = config
 
-    def update_config(self, config: dict):
+    def update_config(self, config: dict[str, Any]) -> None:
         self.config = config
 
     async def run(self, positive: str, negative: str, resolution: str) -> bytes | None:
         conf = self.config.get("nai", {})
+        endpoint = str(conf.get("endpoint", "")).strip()
+        if not endpoint:
+            return None
+
         dim = ALLOWED_RESOLUTIONS.get(resolution, ALLOWED_RESOLUTIONS["1024x1024"])
         clean_pos = (positive or "1girl").strip(" ,()")
-        preset = conf.get("promptPreset", "")
+        preset = str(conf.get("promptPreset", "")).strip()
         if preset:
             clean_pos = f"{preset}, {clean_pos}"
         clean_neg = (negative or "").strip(" ,()")
 
-        payload = {
+        payload: dict[str, Any] = {
             "prompt": clean_pos,
             "input": clean_pos,
             "model": "nai-diffusion-3",
@@ -41,14 +51,14 @@ class NaiEngine:
                 "negative_prompt": clean_neg,
             },
         }
-        proxy = conf.get("proxy", "").strip() or None
+        proxy = str(conf.get("proxy", "")).strip() or None
         headers = {
             "Authorization": f"Bearer {conf.get('token', '')}",
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         }
         async with httpx.AsyncClient(proxy=proxy, timeout=90.0) as client:
-            res = await client.post(conf.get("endpoint"), json=payload, headers=headers)
+            res = await client.post(endpoint, json=payload, headers=headers)
             if res.status_code == 200:
                 data = res.json()
                 b64 = (
