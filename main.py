@@ -630,51 +630,6 @@ class AnimeDrawPlugin(Star):
         parsed = self._parse_draw_cli(raw_args)
         clean_prompt = parsed["prompt"]
 
-        event.stop_event()
-
-        if not clean_prompt:
-            await event.send(
-                event.plain_result(
-                    "💡 请提供提示词，例如：/绘图 1girl, silver hair, blue eyes\n"
-                    '可选参数：-w <预设> -s <风格> -r <分辨率> -n "<负向词>"'
-                )
-            )
-            return
-
-        try:
-            await event.send(event.plain_result("🎨 正在绘制，请稍候..."))
-        except Exception as e:
-            logger.warning(f"[Draw] 发送绘图提示失败: {self._sanitize_error(e)}")
-
-        try:
-            success, msg, _, _ = await self._execute_draw_pipeline(
-                event,
-                prompt=clean_prompt,
-                negative=parsed["negative"],
-                resolution=parsed["resolution"] or "1024x1024",
-                workflow_preset=parsed["workflow"],
-                lora_preset=parsed["style"],
-                use_private_paper=False,
-            )
-            if not success:
-                await event.send(event.plain_result(self._sanitize_error(msg)))
-        except Exception as e:
-            clean_err = self._sanitize_error(e)
-            logger.error(f"[Draw] 指令直出执行异常: {clean_err}")
-            await event.send(event.plain_result(f"❌ 绘图失败: {clean_err}"))
-
-    # ================= 触发途径 5：指令直出 =================
-    @filter.command("绘图", alias={"画图", "draw"}, priority=1000)
-    async def cmd_draw(self, event: AstrMessageEvent):
-        """手动绘图指令。用法：/绘图 [-w 预设] [-s 风格] [-r 分辨率] [-n 负向词] <提示词>"""
-        msg_str = event.message_str.strip()
-        raw_args = re.sub(
-            r"^[!/\\#]?(绘图|画图|draw)\s*", "", msg_str, flags=re.IGNORECASE
-        ).strip()
-
-        parsed = self._parse_draw_cli(raw_args)
-        clean_prompt = parsed["prompt"]
-
         if not clean_prompt:
             event.stop_event()
             yield event.plain_result(
