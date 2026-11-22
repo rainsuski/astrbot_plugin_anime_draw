@@ -394,24 +394,25 @@ class AnimeDrawPlugin(Star):
         else:
             self.quota_mgr.deduct_user(quota_user_key, is_whitelist)
 
-        # 8. 构造极简回显文案（仅当 ComfyUI 通道实际挂载了有效 LoRA 时回显风格）
-        if used_engine == "comfy" and active_lora and active_lora.get("name"):
-            finish_text = f"✨ 绘制完成！[风格: {active_lora['name']}]\n"
-        else:
-            finish_text = "✨ 绘制完成！\n"
+        # 8. 构造极简回显文案（仅当 ComfyUI 通道实际挂载了有效 LoRA 时回显风格）        # 构造发送消息链（根据开关决定是否附带提示文案）
+        def build_result_chain(abs_img_path: str, show_text: bool = False) -> list:
+            result = []
+            if show_text:
+                if used_engine == "comfy" and active_lora and active_lora.get("name"):
+                    finish_text = f"✨ 绘制完成！[风格: {active_lora['name']}]\n"
+                else:
+                    finish_text = "✨ 绘制完成！\n"
+                result.append(Plain(finish_text))
+            result.append(CompImage.fromFileSystem(abs_img_path))
+            return result
 
         # 9. 发送图片（统一交由 AstrBot 标准消息链发送）
         if not from_companion and event and hasattr(event, "send"):
             try:
                 abs_img_path = str(img_path.resolve())
-                await event.send(
-                    event.chain_result(
-                        [
-                            Plain(finish_text),
-                            CompImage.fromFileSystem(abs_img_path),
-                        ]
-                    )
-                )
+
+                chain = build_result_chain(abs_img_path)
+                await event.send(event.chain_result(chain))
             except Exception as e:
                 clean_err = self._sanitize_error(e)
                 logger.error(f"[Draw] 协议端发图失败: {clean_err}")
@@ -486,7 +487,7 @@ class AnimeDrawPlugin(Star):
                         text=(
                             f"【绘制成功】{paper_tip}\n"
                             f"本地图片路径: {abs_path}\n"
-                            "所附图片为本次绘制结果的缩略图，供参考评价。"
+                            "所附图片为本次绘制结果的缩略图，供参考评价，原图已自动进行推送，你无须重复操作。"
                         ),
                     ),
                     ImageContent(type="image", data=b64_img, mimeType="image/jpeg"),
